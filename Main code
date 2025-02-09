@@ -1,0 +1,875 @@
+#Installation of packages 
+install.packages("/Users/emmaarussi/Documents/Econometrics_Minor/PackageN_CPB/NLMD_3.1.1.tar.gz", repos = NULL)
+install.packages(c("lubridate", "reshape2"))
+#install.packages("zoo")
+#install.packages("ggplot2")
+#install.packages("forecast")
+#install.packages("caret")
+#install.packages("lattice")
+
+# Libraries 
+library(dplyr)
+library(NLMD)
+library(lattice)
+library(forecast)
+library(caret)
+library("NLMD")
+library("reshape2")
+library("dplyr")
+library("data.table")
+library("lubridate")
+library(zoo)
+library(ggplot2)
+(load_nldata)
+
+# Loading of data
+data <- load_nlmd(path_file = "/Users/chejduk/Downloads/Practical_Case/NLdata.RData", frequency = "M", min_period = "2010M01", max_period = "2020M12", transform = TRUE)
+
+## Transformations of data !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+data$period <- as.Date(paste0(data$period, "01"), format = "%YM%m%d")
+
+# Sorting data
+data <- data %>% arrange(period)
+
+# Laging all variables by 1 period, except for unemployment variable and period 
+datalagged <- data %>%
+  mutate(across(setdiff(names(.), c("fdif_log_arb_beroepsbevolking_werkloos", "period")), lag, n = 1, default = NA))
+
+View(datalagged)
+
+# Move unemployment variable to the first column
+datalagged <- datalagged %>% select(period, fdif_log_arb_beroepsbevolking_werkloos, everything())
+
+# Calculate the number of NAs
+na_counts <- colSums(is.na(datalagged))
+
+# Remove columns with more than 5 NA values
+columns_to_keep <- names(na_counts[na_counts <= 2])
+datalagged_clean <- datalagged %>% select(all_of(columns_to_keep))
+
+View(datalagged_clean)
+
+transformed_data <- datalagged_clean %>%
+  filter(period >= as.Date("2010-03-01"))
+
+View(transformed_data)
+
+
+##Time series plot for the variable of interest!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+time_series <- ts(transformed_data$fdif_log_arb_beroepsbevolking_werkloos, start = c(2010, 3), end = c(2018, 10), frequency = 12)
+
+# Plot the time series
+plot(time_series, main = "Stationary Unemployment Rate in Netherlands",
+     xlab = "Time", ylab = "Unemployment")
+
+## AR(p) models!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+## AIC!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# Fit AR(p) model and return AIC
+get_AIC <- function(p) {
+  model <- arima(time_series, order = c(p, 0, 0))
+  AIC(model)
+}
+
+# Find the optimal lag order
+order_selection <- sapply(1:10, get_AIC)
+best_order <- which.min(order_selection)
+
+# Print the best lag order
+cat("Best AR order:", best_order, "\n")
+
+# Fit the most optional AR(p) model
+best_model <- arima(time_series, order = c(best_order, 0, 0))
+
+# Residuals
+residuals <- residuals(best_model)
+
+# Calculate RMSE of the best AR(p) model 
+rmse <- sqrt(mean(residuals^2))
+cat("RMSE:", rmse, "\n")
+
+##K-FOLD CV AR(p)!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+df <- transformed_data
+
+# Split data to training and testing sets
+split_index <- floor(0.8 * nrow(df))
+train_data <- df[1:split_index, "fdif_log_arb_beroepsbevolking_werkloos"]
+test_data <- df[(split_index + 1):nrow(df), "fdif_log_arb_beroepsbevolking_werkloos"]
+
+# K-fold cross-validation
+k <- 20
+p_values <- 1:5
+best_cv_rmse <- Inf
+best_p <- NULL
+
+for (p in p_values) {
+  folds <- createFolds(train_data, k = k, list = TRUE, returnTrain = FALSE)
+  rmse_values <- sapply(folds, function(test_indices) {
+    test_data_cv <- train_data[test_indices]
+    train_data_cv <- train_data[-test_indices]
+    ar_model <- ar(train_data_cv, order.max = p)
+    predictions <- predict(ar_model, n.ahead = length(test_data_cv))$pred
+    rmse <- sqrt(mean((predictions - test_data_cv)^2))
+    return(rmse)
+  })
+  mean_rmse <- mean(rmse_values)
+  if (mean_rmse < best_cv_rmse) {
+    best_cv_rmse <- mean_rmse
+    best_p <- p
+  }
+}
+
+# Print the best lag order value and the CV RMSE
+print(paste("Best AR order from CV:", best_p))
+print(paste("Best CV RMSE:", best_cv_rmse))
+
+
+##POOS CV AR(p)!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+df <- transformed_data
+
+# Split data into training and test sets
+split_index <- floor(0.8 * nrow(df))
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):nrow(df), ]
+
+# Define parameters
+max_p <- 5
+window_size <- 12  # Set value manually
+fixed_window <- TRUE # Set value manually TRUE or FALSE
+
+# Prepare to validate
+best_overall_rmse <- Inf
+best_p <- NULL
+best_model_cv_rmse <- NULL
+
+
+# Validation on the training set
+for (p in 1:max_p) {
+  rolling_predictions <- numeric(length = nrow(train_data) - window_size)
+  for (i in (window_size + 1):nrow(train_data)) {
+    if (fixed_window) {
+      if (i == window_size + 1) {
+        fit_data <- train_data[1:window_size, ]
+        model_fit <- Arima(fit_data$fdif_log_arb_beroepsbevolking_werkloos, order = c(p, 0, 0))
+      }
+      rolling_predictions[i - window_size] <- forecast(model_fit, h = 1)$mean
+    } else {
+      updated_train_data <- train_data[(i - window_size):(i - 1), ]
+      rolling_predictions[i - window_size] <- fit_and_forecast(updated_train_data$fdif_log_arb_beroepsbevolking_werkloos, p)
+    }
+  }
+  actual_values <- train_data[(window_size + 1):nrow(train_data), ]$fdif_log_arb_beroepsbevolking_werkloos
+  rmse <- sqrt(mean((rolling_predictions - actual_values)^2))
+  if (rmse < best_overall_rmse) {
+    best_overall_rmse <- rmse
+    best_p <- p
+    best_model_cv_rmse <- rmse
+  }
+}
+
+# Print best model lag order and RMSE
+print(paste("Best AR(p) model: p =", best_p, ", Window Size =", window_size, ", Fixed Window =", fixed_window, ", CV RMSE =", best_model_cv_rmse))
+
+
+##Forecast the next values with rolling prediction H = 1, 3 or 12
+
+# Fit AR(p) model
+far2 <- function(x, h) {
+  forecast(Arima(x, order = c(3, 0, 0)), h = h)
+}
+
+# Choose the time series
+time_series <- ts(transformed_data$fdif_log_arb_beroepsbevolking_werkloos, start = c(2010, 3), frequency = 12)
+
+# Choose parameters
+window_length <- 104
+forecast_horizons <- c(1, 3, 12)
+
+# Store mean forecast errors for different horizons
+mean_errors <- numeric(length(forecast_horizons))
+
+# Fit the AR(p) model with rolling window and get forecast errors
+for (h in forecast_horizons) {
+  errors <- tsCV(time_series, far2, h = h, window = window_length)
+  
+  # Dealing with NAs values through excluding them
+  errors <- errors[!is.na(errors)]
+  
+  # Calculate mean of forecast errors
+  mean_errors[h == forecast_horizons] <- mean(errors)
+}
+
+# Print results
+cat("Mean error for h=1:", mean_errors[1], "\n")
+cat("Mean error for h=3:", mean_errors[2], "\n")
+cat("Mean error for h=12:", mean_errors[3], "\n")
+
+## AR(p) forecasting tsCV function!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# Fit AR(p)
+far2 <- function(x, h) {
+  forecast(Arima(x, order = c(1, 0, 0)), h = h)
+}
+
+# Used time series
+time_series <- ts(transformed_data$fdif_log_arb_beroepsbevolking_werkloos, start = c(2010, 3), frequency = 12)
+
+# Adjust manually rolling window length
+window_length <- 104
+
+# Specify horizons
+forecast_horizons <- c(1, 3, 12)
+
+# Store mean forecast errors
+mean_errors <- numeric(length(forecast_horizons))
+rmse_values <- numeric(length(forecast_horizons))
+
+# Iterate each forecast horizon
+for (h in forecast_horizons) {
+  # Fit the ARIMA model with rolling window and get forecast errors
+  errors <- tsCV(time_series, far2, h = h, window = window_length)
+  
+  # Exclude NAs
+  errors <- errors[!is.na(errors)]
+  
+  # Mean of forecast errors
+  mean_errors[h == forecast_horizons] <- mean(errors)
+  
+  # RMSE
+  rmse_values[h == forecast_horizons] <- sqrt(mean(errors^2))
+}
+
+# Mean errors and RMSE
+cat("Mean error for h=1:", mean_errors[1], "\n")
+cat("RMSE for h=1:", rmse_values[1], "\n")
+
+cat("Mean error for h=3:", mean_errors[2], "\n")
+cat("RMSE for h=3:", rmse_values[2], "\n")
+
+cat("Mean error for h=12:", mean_errors[3], "\n")
+cat("RMSE for h=12:", rmse_values[3], "\n")
+
+## Machine learning Enet model!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+## Elastic net Kfold and POOS for horizon = 3!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# Data preparation, horizon = 3
+data <- load_nlmd(path_file = "/Users/tessscholtus/Downloads/p_NLMD_package/NLdata.RData", frequency = "M", min_period = "2010M01", max_period = "2020M12", transform = TRUE)
+
+data$period <- as.Date(paste0(data$period, "01"), format = "%YM%m%d")
+
+# Sort data
+data <- data %>% arrange(period)
+
+View(data)
+
+# Lag variables by 1 period, except for unemployment and period
+datalagged <- data %>%
+  mutate(across(setdiff(names(.), c("fdif_log_arb_beroepsbevolking_werkloos", "period")), lag, n = 3, default = NA))
+
+datalagged <- datalagged %>% select(period, fdif_log_arb_beroepsbevolking_werkloos, everything())
+
+# Transformations
+data2 <- load_nlmd(path_file = "/Users/tessscholtus/Downloads/p_NLMD_package/NLdata.RData", frequency = "M", min_period = "2010M01", max_period = "2020M12")
+
+data2$fdif_log_arb_beroepsbevolking_werkloos <- c(NA, diff(log(data2$arb_beroepsbevolking_werkloos), differences = 1))
+
+data2$period <- as.Date(paste0(data2$period, "01"), format = "%YM%m%d")
+data2 <- data2 %>% arrange(period)
+
+# Select only unemployment variable column 
+data2 <- data2 %>% select(fdif_log_arb_beroepsbevolking_werkloos)
+
+View(data2)
+
+# Replace the unemployment variable in data with that from data2
+datalagged$fdif_log_arb_beroepsbevolking_werkloos <- data2$fdif_log_arb_beroepsbevolking_werkloos
+
+View(datalagged)
+
+# NAsin each column
+na_counts <- colSums(is.na(datalagged))
+
+# Remove columns with more than 5 NAs 
+columns_to_keep <- names(na_counts[na_counts <= 3])
+datalagged_clean <- datalagged %>% select(all_of(columns_to_keep))
+
+View(datalagged_clean)
+
+transformed_data <- datalagged_clean %>%
+  filter(period >= as.Date("2010-05-01"))
+
+View(transformed_data)
+
+# Calculate the number of NAs
+na_counts_transformed <- colSums(is.na(transformed_data))
+
+# NAs values
+print(na_counts_transformed)
+
+# Libraries
+library(glmnet)
+library(data.table)
+library(caret)
+library(timetk)
+library(lattice)
+library(ggplot2)
+library(dplyr)
+
+df <- transformed_data
+
+# Split data to training and test set
+split_index <- floor(0.8 * nrow(df))
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):nrow(df), ]
+
+# Parameters for horizon = 3
+rolling_window <- createTimeSlices(
+  1:nrow(train_data),
+  initialWindow = 36,  
+  horizon = 3,  # Horizon changed to 3           
+  fixedWindow = FALSE,                    
+  skip = 0                  
+)
+
+# Hyperparameter tuning
+param_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),  # Adjust manually
+                          lambda = seq(0.001, 0.1, length = 100))  # Adjust manually
+
+
+# Training control
+ctrl <- trainControl(
+  method = "timeslice",
+  index = rolling_window$train,
+  indexOut = rolling_window$test,
+  allowParallel = TRUE
+)
+
+# Model definition using library glmnet
+model <- train(
+  x = train_data[, setdiff(names(train_data), "fdif_log_arb_beroepsbevolking_werkloos"), drop = FALSE],
+  y = train_data$fdif_log_arb_beroepsbevolking_werkloos,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = param_grid,
+  tuneLength = 10 
+)
+
+# Print the results
+print(model$results)
+
+# Find the best hyperparameters
+best_model <- model$bestTune
+print(best_model)
+
+# RMSE of the best model
+best_model_rmse <- min(model$results$RMSE)
+print(paste("RMSE of the best model:", best_model_rmse))
+
+# the best hyperparameters
+best_hyperparameters <- model$bestTune
+
+# Rolling window predictions with a horizon = 3
+rolling_predictions <- numeric(nrow(test_data))
+
+# Update training set with the rolling window
+for (i in 1:(nrow(test_data) - 2)) {  # Adjust the loop for a horizon = 3
+  updated_train_data <- rbind(train_data, test_data[1:i, ])
+  
+  # Re-train the model using the best hyperparameters
+  retrained_model <- train(
+    x = updated_train_data[, setdiff(names(updated_train_data), "fdif_log_arb_beroepsbevolking_werkloos"), drop = FALSE],
+    y = updated_train_data$fdif_log_arb_beroepsbevolking_werkloos,
+    method = "glmnet",
+    trControl = ctrl,  
+    tuneGrid = best_hyperparameters 
+  )
+  
+  # Make a prediction for the next 3 periods with the re-trained model
+  if (i <= nrow(test_data) - 3) {
+    rolling_predictions[i:(i+2)] <- predict(retrained_model, newdata = test_data[(i+1):(i+3), , drop = FALSE])
+  }
+}
+
+# Compare forecasts with the actual values
+actual_values <- test_data$fdif_log_arb_beroepsbevolking_werkloos
+
+# RMSE for rolling predictions with a horizon = 3
+rolling_rmse <- sqrt(mean((rolling_predictions - actual_values)^2))
+print(paste("Rolling Window RMSE for Horizon 3:", rolling_rmse))
+print(rolling_predictions)
+
+df <- transformed_data 
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Split data into training and test sets
+total_rows <- nrow(df)
+split_index <- round(0.8 * total_rows)
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):total_rows, ]
+
+# k-Fold Cross-Validation
+tc <- trainControl(method = "cv", number = 10)
+
+# Hyperparameter tuning
+param_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),
+                          lambda = seq(0.001, 0.1, length = 100))
+
+# Train model
+model <- train(fdif_log_arb_beroepsbevolking_werkloos ~ .,
+               data = train_data,
+               method = "glmnet",
+               preProcess = c("center", "scale"),
+               tuneGrid = param_grid,
+               trControl = tc,
+               metric = "RMSE")
+
+# The best model hyperparameters and RMSE
+best_model_params <- model$bestTune
+best_model_rmse <- min(model$results$RMSE)
+
+print("Best Model Hyperparameters:")
+print(best_model_params)
+print(paste("Best Model RMSE:", best_model_rmse))
+
+# Rolling Predictions for test data
+rolling_predictions <- numeric(nrow(test_data) - 3)
+
+# Predictions for each window = 12 in test_data and predict 12 points
+for (i in 1:(nrow(test_data) - 3)) {
+  rolling_predictions[i:(i+3)] <- predict(model, newdata = test_data[i:(i+3), ])
+}
+
+# RMSE for rolling predictions with a horizon = 12
+actual_values <- test_data$fdif_log_arb_beroepsbevolking_werkloos[1:(length(rolling_predictions))]
+rolling_rmse <- sqrt(mean((rolling_predictions - actual_values)^2))
+print(paste("Rolling Window RMSE for Horizon 3:", rolling_rmse))
+print(rolling_predictions)
+
+# Robustness check horizon broadening
+horizons <- 3
+predictions <- matrix(nrow = nrow(test_data) - horizons + 1, ncol = horizons)
+
+# Rolling predictions
+for (i in 1:(nrow(test_data) - horizons + 1)) {
+  for (h in 1:horizons) {
+    if ((i + h - 1) <= nrow(test_data)) {
+      # Predict the h-th point ahead, based on the data available up to point i+h-1
+      predictions[i, h] <- predict(model, newdata = test_data[i:(i+h-1), ])[h]
+    }
+  }
+}
+
+print(predictions)
+
+
+rmse_horizon_3 <- sqrt(mean((predictions[1:(nrow(predictions)-2), 3] - actual_values[3:length(actual_values)])^2))
+
+# RMSE for the horizon = 3
+print(paste("RMSE for Horizon 3:", rmse_horizon_3))
+
+## Elastic net POOS for horizon = 1!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+df <- transformed_data
+
+# Split data into training and test set
+split_index <- floor(0.8 * nrow(df))
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):nrow(df), ]
+
+# Define parameters aand adjust initialWindow manually 
+rolling_window <- createTimeSlices(
+  1:nrow(train_data),
+  initialWindow = 36,  
+  horizon = 1,              
+  fixedWindow = FALSE,                    
+  skip = 0                  
+)
+
+# Hyperparameter tuning
+param_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),  # Adjust the step size
+                          lambda = seq(0.001, 0.1, length = 100))  # Adjust the range
+
+# Set up training control
+ctrl <- trainControl(
+  method = "timeslice",
+  index = rolling_window$train,
+  indexOut = rolling_window$test,
+  allowParallel = TRUE
+)
+
+# Define the model with library glmnet
+model <- train(
+  x = train_data[, setdiff(names(train_data), "fdif_log_arb_beroepsbevolking_werkloos"), drop = FALSE],
+  y = train_data$fdif_log_arb_beroepsbevolking_werkloos,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = param_grid,
+  tuneLength = 10 
+)
+
+# Print the results 
+print(model$results)
+
+# The best hyperparameters
+best_model <- model$bestTune
+print(best_model)
+
+# Print the RMSE of the best model
+best_model_rmse <- min(model$results$RMSE)
+print(paste("RMSE of the best model:", best_model_rmse))
+
+# The best hyperparameters
+best_hyperparameters <- model$bestTune
+
+# Rolling window predictions
+rolling_predictions <- numeric(nrow(test_data))
+
+# Update train_data with the rolling window
+for (i in 1:nrow(test_data)) {
+  updated_train_data <- rbind(train_data, test_data[1:i, ])
+  
+  # Re-train model with best hyperparameters
+  retrained_model <- train(
+    x = updated_train_data[, setdiff(names(updated_train_data), "fdif_log_arb_beroepsbevolking_werkloos"), drop = FALSE],
+    y = updated_train_data$fdif_log_arb_beroepsbevolking_werkloos,
+    method = "glmnet",
+    trControl = ctrl,  
+    tuneGrid = best_hyperparameters  # Use the best hyperparameters
+  )
+  
+  # Make a forecast for the next point with the re-trained model
+  rolling_predictions[i] <- predict(retrained_model, newdata = test_data[i, , drop = FALSE])
+}
+
+# Rolling predictions versus actual data
+actual_values <- test_data$fdif_log_arb_beroepsbevolking_werkloos
+
+# Calculate RMSE
+rolling_rmse <- sqrt(mean((rolling_predictions - actual_values)^2))
+print(paste("Rolling Window RMSE:", rolling_rmse))
+
+print(rolling_predictions)
+
+# Plot
+library(ggplot2)
+plot_data <- data.frame(
+  Index = 1:length(actual_values),
+  Actual = actual_values,
+  Predicted = rolling_predictions
+)
+
+ggplot(plot_data, aes(x = Index)) +
+  geom_line(aes(y = Actual, colour = "Actual Values")) +
+  geom_line(aes(y = Predicted, colour = "Predicted Values")) +
+  labs(title = "Actual vs Predicted", x = "Index", y = "Values") +
+  scale_colour_manual("", 
+                      breaks = c("Actual Values", "Predicted Values"),
+                      values = c("blue", "red"))
+
+
+## Elastic net Kfold for horizon = 1!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# Data
+df <- transformed_data 
+
+# Training and test sets
+set.seed(123)
+total_rows <- nrow(df)
+split_index <- round(0.8 * total_rows)
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):total_rows, ]
+
+# Adjust number of folds manually
+tc <- trainControl(method = "cv", number = 10)
+
+# Hyperparameter tuning
+param_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),  # Adjust manually
+                          lambda = seq(0.001, 0.1, length = 100))  # Adjust manually
+
+model <- train(fdif_log_arb_beroepsbevolking_werkloos ~ .,
+               data = train_data,
+               method = "glmnet",
+               preProcess = c("center", "scale"),
+               tuneGrid = param_grid,
+               trControl = tc,
+               metric = "RMSE")
+
+# The best model hyperparameters and RMSE
+best_model_params <- model$bestTune
+best_model_rmse <- min(model$results$RMSE)
+
+print("Best Model Hyperparameters:")
+print(best_model_params)
+print(paste("Best Model RMSE:", best_model_rmse))
+
+
+# Rolling Predictions with k-Fold Cross Validation (updating model)
+rolling_predictions <- numeric(length(test_data))
+for (i in 1:nrow(test_data)) {
+  updated_data <- rbind(train_data, test_data[1:i, ])
+  updated_model <- train(fdif_log_arb_beroepsbevolking_werkloos ~ .,
+                         data = updated_data,
+                         method = "glmnet",
+                         preProcess = c("center", "scale"),
+                         tuneGrid = param_grid,
+                         trControl = tc,
+                         metric = "RMSE")
+  
+  # Predict the next point
+  next_pred <- predict(updated_model, newdata = test_data[i, ])
+  rolling_predictions[i] <- next_pred
+}
+
+# Plot the hyperparameters tuning
+plot(model, pch = "")
+
+# Test RMSE
+test_rmse <- sqrt(mean((test_data$fdif_log_arb_beroepsbevolking_werkloos - rolling_predictions)^2))
+print(paste("Test RMSE with Rolling Predictions:", test_rmse))
+
+#Evaluate the model
+predictions <- predict(model, newdata = test_data)
+
+best_ix <- which.min(model$results$RMSE)
+model$results[best_ix, ]
+
+#Plot for the hyperparameter tuning
+plot(model, pch = "")
+
+#Test RMSE
+test_rmse <- sqrt(mean((test_data$fdif_log_arb_beroepsbevolking_werkloos - predictions)^2))
+print(test_rmse)
+
+#Plot of the results: actual vs predicted
+test_data$period <- as.Date(test_data$period)
+plot(test_data$period, test_data$fdif_log_arb_beroepsbevolking_werkloos, type = "l", col = "blue", lwd = 2,
+     main = "Actual vs Predicted",
+     xlab = "Time",
+     ylab = "Values")
+
+lines(test_data$period, predictions, col = "red", lwd = 2)
+
+legend("topright", legend = c("Actual", "Predicted"), col = c("blue", "red"), lty = 1, cex = 0.8, xjust = 1, yjust = 1)
+
+## Elastic net Kfold and POOS for horizon = 12!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+#POOS
+# Data preparation
+data <- load_nlmd(path_file = "/Users/tessscholtus/Downloads/p_NLMD_package/NLdata.RData", frequency = "M", min_period = "2010M01", max_period = "2020M12", transform = TRUE)
+
+data$period <- as.Date(paste0(data$period, "01"), format = "%YM%m%d")
+data <- data %>% arrange(period)
+
+View(data)
+
+# Lag all variables by 1 period, except for unemployment and period variables
+datalagged <- data %>%
+  mutate(across(setdiff(names(.), c("fdif_log_arb_beroepsbevolking_werkloos", "period")), lag, n = 12, default = NA))
+datalagged <- datalagged %>% select(period, fdif_log_arb_beroepsbevolking_werkloos, everything())
+
+# Load data
+data2 <- load_nlmd(path_file = "/Users/tessscholtus/Downloads/p_NLMD_package/NLdata.RData", frequency = "M", min_period = "2010M01", max_period = "2020M12")
+
+data2$fdif_log_arb_beroepsbevolking_werkloos <- c(NA, diff(log(data2$arb_beroepsbevolking_werkloos), differences = 1))
+data2$period <- as.Date(paste0(data2$period, "01"), format = "%YM%m%d")
+data2 <- data2 %>% arrange(period)
+data2 <- data2 %>% select(fdif_log_arb_beroepsbevolking_werkloos)
+
+View(data2)
+
+# Replace the unemployment column in data with that from data2
+datalagged$fdif_log_arb_beroepsbevolking_werkloos <- data2$fdif_log_arb_beroepsbevolking_werkloos
+
+View(datalagged)
+
+# NAs values
+na_counts <- colSums(is.na(datalagged))
+
+# Remove columns with more than 5 NAs
+columns_to_keep <- names(na_counts[na_counts <= 12])
+datalagged_clean <- datalagged %>% select(all_of(columns_to_keep))
+
+View(datalagged_clean)
+
+transformed_data <- datalagged_clean %>%
+  filter(period >= as.Date("2011-01-01"))
+
+View(transformed_data)
+
+# the number of NAs
+na_counts_transformed <- colSums(is.na(transformed_data))
+print(na_counts_transformed)
+
+df <- transformed_data
+
+# Split data into training and test set
+split_index <- floor(0.8 * nrow(df))
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):nrow(df), ]
+
+# Define parameters for a horizon = 12
+rolling_window <- createTimeSlices(
+  1:nrow(train_data),
+  initialWindow = 12,  
+  horizon = 12, 
+  fixedWindow = TRUE,                    
+  skip = 0
+)
+
+# Hyperparameter tuning
+param_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),  # Adjust manually
+                          lambda = seq(0.001, 0.1, length = 100))  # Adjust manually
+
+# Set up training control
+ctrl <- trainControl(
+  method = "timeslice",
+  index = rolling_window$train,
+  indexOut = rolling_window$test,
+  allowParallel = TRUE
+)
+
+# Define the model with library glmnet
+model <- train(
+  x = train_data[, setdiff(names(train_data), "fdif_log_arb_beroepsbevolking_werkloos"), drop = FALSE],
+  y = train_data$fdif_log_arb_beroepsbevolking_werkloos,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = param_grid,
+  tuneLength = 10
+)
+
+# Print the results 
+print(model$results)
+
+# Find the best hyperparameters
+best_model <- model$bestTune
+print(best_model)
+
+# RMSE of the best model
+best_model_rmse <- min(model$results$RMSE)
+print(paste("RMSE of the best model:", best_model_rmse))
+
+# the best hyperparameters
+best_hyperparameters <- model$bestTune
+
+# Prepare for rolling window predictions with a horizon = 12
+rolling_predictions <- numeric(nrow(test_data) - 11)
+
+for (i in 1:(nrow(test_data) - 11)) {
+  updated_train_data <- rbind(train_data, test_data[1:i, ])
+  
+  # Re-train the model with the best hyperparameters
+  retrained_model <- train(
+    x = updated_train_data[, setdiff(names(updated_train_data), "fdif_log_arb_beroepsbevolking_werkloos"), drop = FALSE],
+    y = updated_train_data$fdif_log_arb_beroepsbevolking_werkloos,
+    method = "glmnet",
+    trControl = ctrl,  
+    tuneGrid = best_hyperparameters
+  )
+  
+  # Make a prediction for the next 12 points with re-trained model
+  if (i <= nrow(test_data) - 12) {
+    rolling_predictions[i:(i+11)] <- predict(retrained_model, newdata = test_data[(i+1):(i+12), , drop = FALSE])
+  }
+}
+
+# Rolling predictions versus the actual values
+actual_values <- test_data$fdif_log_arb_beroepsbevolking_werkloos
+
+# Calculate RMSE for rolling predictions
+rolling_rmse <- sqrt(mean((rolling_predictions - actual_values)^2))
+print(paste("Rolling Window RMSE for Horizon 12:", rolling_rmse))
+
+print(rolling_predictions)
+
+
+#KFOLD horizon = 12
+
+df <- transformed_data 
+set.seed(123)
+
+# Split data into training and train sets
+total_rows <- nrow(df)
+split_index <- round(0.8 * total_rows)
+train_data <- df[1:split_index, ]
+test_data <- df[(split_index + 1):total_rows, ]
+
+# k-Fold Cross-Validation
+tc <- trainControl(method = "cv", number = 10)
+
+# Hyperparameter tuning
+param_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),
+                          lambda = seq(0.001, 0.1, length = 100))
+
+# Train model
+model <- train(fdif_log_arb_beroepsbevolking_werkloos ~ .,
+               data = train_data,
+               method = "glmnet",
+               preProcess = c("center", "scale"),
+               tuneGrid = param_grid,
+               trControl = tc,
+               metric = "RMSE")
+
+# Best model hyperparameters and RMSE
+best_model_params <- model$bestTune
+best_model_rmse <- min(model$results$RMSE)
+
+print("Best Model Hyperparameters:")
+print(best_model_params)
+print(paste("Best Model RMSE:", best_model_rmse))
+
+# Rolling Predictions for test data
+rolling_predictions <- numeric(nrow(test_data) - 11)
+
+# Predictions for each window = 12 in test_data
+for (i in 1:(nrow(test_data) - 11)) {
+  # Predict 12 points ahead
+  rolling_predictions[i:(i+11)] <- predict(model, newdata = test_data[i:(i+11), ])
+}
+
+# RMSE for rolling predictions with a horizon = 12
+actual_values <- test_data$fdif_log_arb_beroepsbevolking_werkloos[1:(length(rolling_predictions))]
+rolling_rmse <- sqrt(mean((rolling_predictions - actual_values)^2))
+print(paste("Rolling Window RMSE for Horizon 12:", rolling_rmse))
+print(rolling_predictions)
+
+# Robustness check 
+horizons <- 12
+predictions <- matrix(nrow = nrow(test_data) - horizons + 1, ncol = horizons)
+
+# Rolling predictions
+for (i in 1:(nrow(test_data) - horizons + 1)) {
+  for (h in 1:horizons) {
+    if ((i + h - 1) <= nrow(test_data)) {
+      # Predict the h-th point ahead, based on the data available up to point i+h-1
+      predictions[i, h] <- predict(model, newdata = test_data[i:(i+h-1), ])[h]
+    }
+  }
+}
+
+print(predictions)
+
+# RMSE for horizon = 12
+rmse_horizon_12 <- sqrt(mean((predictions[1:(nrow(predictions)-11), 12] - actual_values[12:length(actual_values)])^2))
+
+# RMSE for the horizon = 12
+print(paste("RMSE for Horizon 12:", rmse_horizon_12))
+
+## Mean Squared Forecast Errors for Enet and AR(1)
+msfe_enet <- 1.2077  ^2     #adjust manually
+msfe_ar1 <- 1.2195 ^2      #adjust manually
+
+# Number of observations
+T <- 130
+
+# DM test statistic
+dm_test_statistic <- (msfe_enet - msfe_ar1) / sqrt((1/T) * (msfe_enet + msfe_ar1))
+cat("Diebold-Mariano Test Statistic (Non-parametric):", dm_test_statistic, "\n")
